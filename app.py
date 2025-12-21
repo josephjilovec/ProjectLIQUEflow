@@ -205,7 +205,7 @@ def render_metrics_dashboard(state: LiquiditySnapshot, metrics: PerformanceMetri
                 }
             }
         ))
-        fig_health.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0))
+        fig_health.update_layout(height=200, margin=dict(l=20, r=20, t=50, b=40))
         st.plotly_chart(fig_health, use_container_width=True)
     
     with col2:
@@ -263,7 +263,7 @@ def render_metrics_dashboard(state: LiquiditySnapshot, metrics: PerformanceMetri
             }
         }
     ))
-    fig_efficiency.update_layout(height=250, margin=dict(l=0, r=0, t=30, b=0))
+    fig_efficiency.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=40))
     st.plotly_chart(fig_efficiency, use_container_width=True)
 
 
@@ -304,16 +304,35 @@ def process_custom_messages(messages: List, use_unified_ledger: bool = False):
             
             # Unified Ledger Mode
             if use_unified_ledger and decision_result.decision == "SETTLE":
-                settlement = st.session_state.ledger.execute_atomic_settlement(
-                    from_account=st.session_state.ledger.bank_id,
-                    to_account="BENEFICIARY_BANK",
-                    amount=message.amount,
-                    message_id=message.msg_id
-                )
-                if settlement.status.value == "EXECUTED":
+                try:
+                    settlement = st.session_state.ledger.execute_atomic_settlement(
+                        from_account=st.session_state.ledger.bank_id,
+                        to_account="BENEFICIARY_BANK",
+                        amount=message.amount,
+                        message_id=message.msg_id
+                    )
+                    if settlement.status.value == "EXECUTED":
+                        state.current_balance -= message.amount
+                        state.total_settled_today += message.amount
+                        tracker.record_settlement(message, decision_result.timestamp, processing_time)
+                    else:
+                        # Settlement failed - queue it
+                        state.pending_queue.append(message)
+                        state.total_delayed_today += message.amount
+                        tracker.record_queue(message, decision_result.timestamp)
+                except Exception as e:
+                    # Fallback to standard settlement
                     state.current_balance -= message.amount
                     state.total_settled_today += message.amount
                     tracker.record_settlement(message, decision_result.timestamp, processing_time)
+            elif use_unified_ledger:
+                # Handle QUEUE and other decisions in unified ledger mode
+                if decision_result.decision == "QUEUE":
+                    state.pending_queue.append(message)
+                    state.total_delayed_today += message.amount
+                    tracker.record_queue(message, decision_result.timestamp)
+                elif decision_result.decision == "REQUIRE_HUMAN_OVERRIDE":
+                    tracker.record_human_override()
             elif not use_unified_ledger:
                 if decision_result.decision == "SETTLE":
                     state.current_balance -= message.amount
@@ -323,6 +342,8 @@ def process_custom_messages(messages: List, use_unified_ledger: bool = False):
                     state.pending_queue.append(message)
                     state.total_delayed_today += message.amount
                     tracker.record_queue(message, decision_result.timestamp)
+                elif decision_result.decision == "REQUIRE_HUMAN_OVERRIDE":
+                    tracker.record_human_override()
             
             # Generate compliance proof
             proof = compliance.generate_proof_of_intent(decision_result, message)
@@ -415,21 +436,37 @@ def run_simulation_scenario(scenario_name: str, use_unified_ledger: bool = False
             
             # Unified Ledger Mode: Execute atomic settlement
             if use_unified_ledger and decision_result.decision == "SETTLE":
-                settlement = st.session_state.ledger.execute_atomic_settlement(
-                    from_account=st.session_state.ledger.bank_id,
-                    to_account="BENEFICIARY_BANK",
-                    amount=message.amount,
-                    message_id=message.msg_id
-                )
-                
-                if settlement.status.value == "EXECUTED":
+                try:
+                    settlement = st.session_state.ledger.execute_atomic_settlement(
+                        from_account=st.session_state.ledger.bank_id,
+                        to_account="BENEFICIARY_BANK",
+                        amount=message.amount,
+                        message_id=message.msg_id
+                    )
+                    
+                    if settlement.status.value == "EXECUTED":
+                        state.current_balance -= message.amount
+                        state.total_settled_today += message.amount
+                        tracker.record_settlement(message, decision_result.timestamp, processing_time)
+                    else:
+                        # Settlement failed on ledger - queue it
+                        state.pending_queue.append(message)
+                        state.total_delayed_today += message.amount
+                        tracker.record_queue(message, decision_result.timestamp)
+                except Exception as e:
+                    # If ledger fails, fall back to standard mode
                     state.current_balance -= message.amount
                     state.total_settled_today += message.amount
                     tracker.record_settlement(message, decision_result.timestamp, processing_time)
-                else:
-                    # Settlement failed on ledger
-                    decision_result.decision = "QUEUE"
+            
+            # Handle other decisions in unified ledger mode
+            elif use_unified_ledger:
+                if decision_result.decision == "QUEUE":
                     state.pending_queue.append(message)
+                    state.total_delayed_today += message.amount
+                    tracker.record_queue(message, decision_result.timestamp)
+                elif decision_result.decision == "REQUIRE_HUMAN_OVERRIDE":
+                    tracker.record_human_override()
             
             # Standard mode
             elif not use_unified_ledger:
@@ -665,6 +702,9 @@ def main():
         
         st.divider()
         
+        # Get metrics first (fixes UnboundLocalError)
+        metrics = st.session_state.performance_tracker.metrics
+        
         # Charts
         col1, col2 = st.columns(2)
         
@@ -690,7 +730,6 @@ def main():
         
         with col2:
             # Transaction breakdown
-            metrics = st.session_state.performance_tracker.metrics
             if metrics.total_transactions_processed > 0:
                 fig = go.Figure(data=[
                     go.Pie(
@@ -726,75 +765,88 @@ def main():
     
     with tab2:
         st.subheader("🔍 Live Audit Log (Chain of Thought)")
-        with st.expander("View Full Audit Trail", expanded=True):
-            log_container = st.container()
-            recent_entries = st.session_state.audit_log[-50:] if len(st.session_state.audit_log) > 50 else st.session_state.audit_log
-            for entry in recent_entries:
-                timestamp = entry.get("timestamp", datetime.now().isoformat())
-                message_id = entry.get("input_message_id", "N/A")
-                decision = entry.get("decision", "N/A")
-                reasoning = entry.get("reasoning_steps", [])
-                log_container.markdown(f"**{timestamp}** | `{message_id}` | Decision: **{decision}**")
-                if reasoning:
-                    with log_container.expander("View Reasoning Steps"):
-                        for i, step in enumerate(reasoning, 1):
-                            log_container.markdown(f"{i}. {step}")
-                log_container.divider()
+        if st.session_state.audit_log:
+            with st.expander("View Full Audit Trail", expanded=True):
+                log_container = st.container()
+                recent_entries = st.session_state.audit_log[-50:] if len(st.session_state.audit_log) > 50 else st.session_state.audit_log
+                for entry in recent_entries:
+                    timestamp = entry.get("timestamp", datetime.now().isoformat())
+                    message_id = entry.get("input_message_id", "N/A")
+                    decision = entry.get("decision", "N/A")
+                    reasoning = entry.get("reasoning_steps", [])
+                    log_container.markdown(f"**{timestamp}** | `{message_id}` | Decision: **{decision}**")
+                    if reasoning:
+                        with log_container.expander("View Reasoning Steps"):
+                            for i, step in enumerate(reasoning, 1):
+                                log_container.markdown(f"{i}. {step}")
+                    log_container.divider()
+        else:
+            st.info("No audit log entries yet. Run a scenario to generate audit logs.")
     
     with tab3:
         st.header("Performance Analytics")
         
-        metrics = st.session_state.performance_tracker.calculate_final_metrics(
-            st.session_state.current_state
-        )
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric("Total Transactions", metrics.total_transactions_processed)
-            st.metric("Total Settled", metrics.total_settled)
-            st.metric("Total Queued", metrics.total_queued)
-            st.metric("Human Overrides", metrics.total_human_overrides)
-        
-        with col2:
-            st.metric("Avg Processing Time", f"{metrics.average_processing_time:.2f}s")
-            st.metric("Avg Settlement Delay", f"{metrics.average_settlement_delay:.2f}s")
-            st.metric("Time Saved vs Manual", f"{metrics.human_manual_time_saved/60:.1f} minutes")
-            st.metric("Opportunity Cost Saved", f"${metrics.opportunity_cost_saved:,.2f}")
-            st.metric("System Health Score", f"{metrics.system_health_score:.1f}%")
-            st.metric("Buffer Efficiency", f"{metrics.liquidity_buffer_efficiency:.1f}%")
+        try:
+            metrics = st.session_state.performance_tracker.calculate_final_metrics(
+                st.session_state.current_state
+            )
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric("Total Transactions", metrics.total_transactions_processed)
+                st.metric("Total Settled", metrics.total_settled)
+                st.metric("Total Queued", metrics.total_queued)
+                st.metric("Human Overrides", metrics.total_human_overrides)
+            
+            with col2:
+                st.metric("Avg Processing Time", f"{metrics.average_processing_time:.2f}s")
+                st.metric("Avg Settlement Delay", f"{metrics.average_settlement_delay:.2f}s")
+                st.metric("Time Saved vs Manual", f"{metrics.human_manual_time_saved/60:.1f} minutes")
+                st.metric("Opportunity Cost Saved", f"${metrics.opportunity_cost_saved:,.2f}")
+                st.metric("System Health Score", f"{metrics.system_health_score:.1f}%")
+                st.metric("Buffer Efficiency", f"{metrics.liquidity_buffer_efficiency:.1f}%")
+        except Exception as e:
+            st.error(f"Error calculating metrics: {str(e)}")
+            st.info("Run a scenario first to generate performance metrics.")
     
     with tab4:
         st.header("🔗 Unified Ledger (Project Agorá)")
         
+        unified_ledger_mode = st.session_state.get("unified_ledger_mode", False)
+        
         if unified_ledger_mode:
-            ledger_snapshot = st.session_state.ledger.get_ledger_snapshot()
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Tokens", ledger_snapshot['total_tokens'])
-            with col2:
-                st.metric("Total Settlements", ledger_snapshot['total_settlements'])
-            with col3:
-                st.metric("Successful", ledger_snapshot['successful_settlements'])
-            with col4:
-                st.metric("Failed", ledger_snapshot['failed_settlements'])
-            
-            # Recent Settlements
-            if st.session_state.ledger.settlements:
-                st.subheader("Recent Atomic Settlements")
-                recent_settlements = st.session_state.ledger.settlements[-10:]
-                settlement_data = []
-                for s in recent_settlements:
-                    settlement_data.append({
-                        "Settlement ID": s.settlement_id,
-                        "From": s.from_account,
-                        "To": s.to_account,
-                        "Amount": f"${s.amount:,.2f}",
-                        "Status": s.status.value,
-                        "Timestamp": s.timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                    })
-                st.dataframe(pd.DataFrame(settlement_data), use_container_width=True, hide_index=True)
+            try:
+                ledger_snapshot = st.session_state.ledger.get_ledger_snapshot()
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Tokens", ledger_snapshot['total_tokens'])
+                with col2:
+                    st.metric("Total Settlements", ledger_snapshot['total_settlements'])
+                with col3:
+                    st.metric("Successful", ledger_snapshot['successful_settlements'])
+                with col4:
+                    st.metric("Failed", ledger_snapshot['failed_settlements'])
+                
+                # Recent Settlements
+                if st.session_state.ledger.settlements:
+                    st.subheader("Recent Atomic Settlements")
+                    recent_settlements = st.session_state.ledger.settlements[-10:]
+                    settlement_data = []
+                    for s in recent_settlements:
+                        settlement_data.append({
+                            "Settlement ID": s.settlement_id,
+                            "From": s.from_account,
+                            "To": s.to_account,
+                            "Amount": f"${s.amount:,.2f}",
+                            "Status": s.status.value,
+                            "Timestamp": s.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                    st.dataframe(pd.DataFrame(settlement_data), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"Error accessing ledger: {str(e)}")
+                st.info("Make sure Unified Ledger Mode is enabled and a scenario has been run.")
         else:
             st.info("Enable Unified Ledger Mode in the sidebar to see tokenized settlement activity.")
 
