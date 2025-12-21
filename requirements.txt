@@ -1,0 +1,29 @@
+# Project Lique-Flow: Autonomous Agentic Layer for Intraday Liquidity Optimization
+# Core Dependencies
+
+# Streamlit for Dashboard
+streamlit>=1.28.0
+
+# LangGraph and LangChain for Agentic Orchestration
+langgraph>=0.0.20
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-anthropic>=0.1.0
+langchain-core>=0.1.0
+
+# Data Validation and Models
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# XML Processing for ISO 20022
+lxml>=4.9.0
+
+# Data Visualization
+plotly>=5.17.0
+pandas>=2.1.0
+
+# Environment and Secrets Management
+python-dotenv>=1.0.0
+
+# Utilities
+python-dateutil>=2.8.0
