@@ -21,6 +21,7 @@ from src.utils.models import LiquiditySnapshot, PerformanceMetrics, DecisionResu
 from src.simulation.scenarios import ScenarioGenerator, PerformanceTracker
 from src.message_generator.iso20022_generator import ISO20022Generator
 from src.security.guardrails import AuditLogger
+from src.utils.data_loader import DataLoader
 
 
 # Page configuration
@@ -120,6 +121,9 @@ def initialize_session_state():
     
     if "decision_history" not in st.session_state:
         st.session_state.decision_history = []
+    
+    if "processed_messages" not in st.session_state:
+        st.session_state.processed_messages = {}  # msg_id -> ISO20022Message mapping
     
     if "stress_test_active" not in st.session_state:
         st.session_state.stress_test_active = False
@@ -269,6 +273,82 @@ def render_stress_indicator():
         st.markdown('<div class="stress-indicator">⚠️ SYSTEMIC STRESS TEST ACTIVE - TRIAGE MODE ENGAGED</div>', unsafe_allow_html=True)
 
 
+def process_custom_messages(messages: List, use_unified_ledger: bool = False):
+    """Process custom uploaded messages."""
+    state = st.session_state.current_state
+    tracker = st.session_state.performance_tracker
+    agent = st.session_state.agent
+    compliance = st.session_state.compliance_agent
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total_messages = len(messages)
+    
+    for i, message in enumerate(messages):
+        progress = (i + 1) / total_messages
+        progress_bar.progress(progress)
+        status_text.text(f"Processing message {i+1}/{total_messages}: {message.msg_id}")
+        
+        try:
+            # Process message
+            start_time = time.time()
+            decision_result = agent.process_message(message, state)
+            processing_time = time.time() - start_time
+            
+            if decision_result is None:
+                continue
+            
+            # Store message
+            st.session_state.processed_messages[message.msg_id] = message
+            
+            # Unified Ledger Mode
+            if use_unified_ledger and decision_result.decision == "SETTLE":
+                settlement = st.session_state.ledger.execute_atomic_settlement(
+                    from_account=st.session_state.ledger.bank_id,
+                    to_account="BENEFICIARY_BANK",
+                    amount=message.amount,
+                    message_id=message.msg_id
+                )
+                if settlement.status.value == "EXECUTED":
+                    state.current_balance -= message.amount
+                    state.total_settled_today += message.amount
+                    tracker.record_settlement(message, decision_result.timestamp, processing_time)
+            elif not use_unified_ledger:
+                if decision_result.decision == "SETTLE":
+                    state.current_balance -= message.amount
+                    state.total_settled_today += message.amount
+                    tracker.record_settlement(message, decision_result.timestamp, processing_time)
+                elif decision_result.decision == "QUEUE":
+                    state.pending_queue.append(message)
+                    state.total_delayed_today += message.amount
+                    tracker.record_queue(message, decision_result.timestamp)
+            
+            # Generate compliance proof
+            proof = compliance.generate_proof_of_intent(decision_result, message)
+            
+            # Update state
+            state.risk_score = decision_result.risk_score
+            state.last_update = datetime.now()
+            
+            # Create audit artifact
+            audit_artifact = AuditLogger.log_decision(decision_result)
+            st.session_state.audit_log.append(audit_artifact)
+            st.session_state.decision_history.append(decision_result)
+            
+            tracker.update_liquidity_peak(state.current_balance)
+            
+        except Exception as e:
+            st.error(f"Error processing message {message.msg_id}: {str(e)}")
+            continue
+        
+        time.sleep(0.05)  # Faster processing for custom data
+    
+    progress_bar.empty()
+    status_text.empty()
+    st.success(f"✅ Processed {total_messages} custom messages!")
+
+
 def run_simulation_scenario(scenario_name: str, use_unified_ledger: bool = False):
     """Run a simulation scenario with optional unified ledger mode."""
     scenario_gen = ScenarioGenerator(initial_balance=st.session_state.current_state.current_balance)
@@ -292,7 +372,7 @@ def run_simulation_scenario(scenario_name: str, use_unified_ledger: bool = False
                 current_buffer=state.current_balance
             )
         elif scenario_name == "End-of-Day Crunch":
-            messages = list(scenario_gen.end_of_day_crunch())
+            messages = list(scenario_gen.end_of_day_crunch(max_messages=100))  # Limit for performance
         elif scenario_name == "Systemic Liquidity Crunch":
             st.session_state.stress_test_active = True
             messages, reduced_projections = scenario_gen.systemic_liquidity_crunch(
@@ -364,6 +444,9 @@ def run_simulation_scenario(scenario_name: str, use_unified_ledger: bool = False
                 elif decision_result.decision == "REQUIRE_HUMAN_OVERRIDE":
                     tracker.record_human_override()
             
+            # Store message for later reference (fixes validation error)
+            st.session_state.processed_messages[message.msg_id] = message
+            
             # Generate compliance proof
             proof = compliance.generate_proof_of_intent(decision_result, message)
             
@@ -397,21 +480,40 @@ def generate_regulatory_report_pdf() -> bytes:
     compliance = st.session_state.compliance_agent
     decisions = st.session_state.decision_history
     
-    # Get messages from decisions
+    # Get messages from stored processed_messages dict
     messages = []
+    processed_messages = st.session_state.get("processed_messages", {})
+    
     for decision in decisions:
-        # Create a minimal message object for the report
-        from src.utils.models import ISO20022Message, PaymentType, PriorityTier
-        msg = ISO20022Message(
-            msg_id=decision.message_id,
-            msg_type=PaymentType.PACS_008,
-            cre_dt_tm=decision.timestamp,
-            priority=PriorityTier.NORMAL,
-            amount=decision.liquidity_before - (decision.liquidity_after or decision.liquidity_before),
-            currency="USD",
-            end_to_end_id=decision.message_id
-        )
-        messages.append(msg)
+        # Try to get the original message from stored messages
+        if decision.message_id in processed_messages:
+            messages.append(processed_messages[decision.message_id])
+        else:
+            # Fallback: Create minimal message if not found
+            # Use a safe amount calculation
+            amount = abs(decision.liquidity_before - (decision.liquidity_after or decision.liquidity_before))
+            if amount == 0:
+                amount = 1000.0  # Default minimum amount
+            
+            from src.utils.models import ISO20022Message, PaymentType, PriorityTier
+            try:
+                msg = ISO20022Message(
+                    msg_id=decision.message_id,
+                    msg_type=PaymentType.PACS_008,
+                    cre_dt_tm=decision.timestamp,
+                    priority=PriorityTier.NORMAL,
+                    amount=amount,
+                    currency="USD",
+                    end_to_end_id=decision.message_id
+                )
+                messages.append(msg)
+            except Exception as e:
+                # Skip invalid messages
+                continue
+    
+    if not messages:
+        # Return empty report if no valid messages
+        return json.dumps({"error": "No valid messages found for report generation"}, indent=2).encode('utf-8')
     
     report = compliance.generate_regulatory_report(decisions, messages)
     
@@ -480,6 +582,34 @@ def main():
             st.session_state.stress_test_active = False
             st.success("System reset!")
             st.rerun()
+        
+        st.divider()
+        
+        st.subheader("📤 Upload Custom Data")
+        uploaded_file = st.file_uploader(
+            "Upload Payment Data (CSV or JSON)",
+            type=['csv', 'json'],
+            help="Upload your proprietary payment dataset to test with real data"
+        )
+        
+        if uploaded_file is not None:
+            if st.button("📊 Process Uploaded Data", type="primary"):
+                try:
+                    data_loader = DataLoader()
+                    custom_messages = data_loader.load_from_file(uploaded_file)
+                    st.success(f"✅ Loaded {len(custom_messages)} messages from {uploaded_file.name}")
+                    
+                    # Store for processing
+                    st.session_state.custom_messages = custom_messages
+                    st.session_state.use_custom_data = True
+                    
+                    # Process the custom messages
+                    st.session_state.simulation_running = True
+                    process_custom_messages(custom_messages, use_unified_ledger=unified_ledger_mode)
+                    st.session_state.simulation_running = False
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error loading file: {str(e)}")
         
         st.divider()
         

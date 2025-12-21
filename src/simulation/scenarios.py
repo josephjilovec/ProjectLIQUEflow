@@ -117,7 +117,8 @@ class ScenarioGenerator:
     def end_of_day_crunch(
         self, 
         cutoff_time: datetime = None,
-        volume_multiplier: float = 5.0
+        volume_multiplier: float = 5.0,
+        max_messages: int = 100  # Limit to prevent performance issues
     ) -> Generator[ISO20022Message, None, None]:
         """
         Scenario C: The End-of-Day Crunch
@@ -126,6 +127,7 @@ class ScenarioGenerator:
         Args:
             cutoff_time: Settlement cutoff time (defaults to 4:30 PM today)
             volume_multiplier: Multiplier for transaction volume
+            max_messages: Maximum number of messages to generate (performance limit)
             
         Yields:
             ISO20022Message objects
@@ -142,30 +144,36 @@ class ScenarioGenerator:
         
         transaction_count = 0
         
-        while current_time < cutoff_time:
+        # Optimize: Generate messages in batches instead of one-by-one
+        time_slots = []
+        for i in range(max_messages):
+            # Distribute messages across the 2-hour window
+            slot_time = start_time + timedelta(seconds=(i * 7200 / max_messages))
+            time_slots.append(slot_time)
+        
+        # Sort by proximity to cutoff (later = higher priority)
+        time_slots.sort()
+        
+        for slot_time in time_slots:
+            if transaction_count >= max_messages:
+                break
+            
             # Volume increases as cutoff approaches
-            time_until_cutoff = (cutoff_time - current_time).total_seconds() / 3600  # hours
+            time_until_cutoff = (cutoff_time - slot_time).total_seconds() / 3600  # hours
             volume_factor = 1.0 + (2.0 - time_until_cutoff) * volume_multiplier
             
-            # Generate transactions with increasing frequency
-            probability = min(volume_factor * 0.1, 0.9)  # Cap at 90%
+            # Generate transaction
+            priority = PriorityTier.NORMAL if random.random() < 0.8 else PriorityTier.HIGH
+            amount = random.uniform(10000, 1000000)  # Smaller amounts, high volume
             
-            if random.random() < probability:
-                # Mostly normal priority payments
-                priority = PriorityTier.NORMAL if random.random() < 0.8 else PriorityTier.HIGH
-                
-                amount = random.uniform(10000, 1000000)  # Smaller amounts, high volume
-                
-                message = self.generator.generate_pacs008(
-                    amount=amount,
-                    priority=priority,
-                    cre_dt_tm=current_time
-                )
-                
-                transaction_count += 1
-                yield message
+            message = self.generator.generate_pacs008(
+                amount=amount,
+                priority=priority,
+                cre_dt_tm=slot_time
+            )
             
-            current_time += timedelta(seconds=random.randint(1, 10))
+            transaction_count += 1
+            yield message
     
     def systemic_liquidity_crunch(
         self,
