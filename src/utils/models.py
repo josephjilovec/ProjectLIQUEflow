@@ -117,3 +117,6 @@ class PerformanceMetrics(BaseModel):
     total_human_overrides: int = Field(default=0, description="Total human override triggers")
     average_processing_time: float = Field(default=0.0, description="Average processing time per transaction (seconds)")
     human_manual_time_saved: float = Field(default=0.0, description="Estimated time saved vs manual processing (seconds)")
+    system_health_score: float = Field(default=100.0, ge=0.0, le=100.0, description="System health score (0-100%)")
+    liquidity_buffer_efficiency: float = Field(default=0.0, ge=0.0, le=100.0, description="Liquidity buffer efficiency percentage")
+    settlement_finality_rate: float = Field(default=100.0, ge=0.0, le=100.0, description="Settlement finality success rate (%)")

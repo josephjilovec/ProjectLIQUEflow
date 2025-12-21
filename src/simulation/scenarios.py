@@ -8,6 +8,7 @@ from typing import List, Generator
 import random
 from src.message_generator.iso20022_generator import ISO20022Generator
 from src.utils.models import ISO20022Message, PriorityTier, LiquiditySnapshot, PerformanceMetrics
+from src.agents.adversarial_agent import AdversarialAgent
 
 
 class ScenarioGenerator:
@@ -166,15 +167,46 @@ class ScenarioGenerator:
             
             current_time += timedelta(seconds=random.randint(1, 10))
     
+    def systemic_liquidity_crunch(
+        self,
+        base_balance: float,
+        stress_level: float = 1.0
+    ) -> tuple[List[ISO20022Message], dict]:
+        """
+        Scenario D: Systemic Liquidity Crunch (Adversarial Stress Test)
+        400% increase in URGENT payments with 50% drop in projected inflows.
+        Tests Priority Triage Algorithm per BIS WP 1310.
+        
+        Args:
+            base_balance: Current balance
+            stress_level: Stress multiplier (1.0 = normal, 2.0 = extreme)
+            
+        Returns:
+            Tuple of (messages, reduced_projections)
+        """
+        adversarial = AdversarialAgent()
+        messages = adversarial.trigger_systemic_stress(base_balance, stress_level)
+        
+        # Generate reduced projections (50% drop)
+        normal_projections = self.generate_incoming_projections(hours_ahead=2)
+        reduced_projections = {
+            k: v * 0.5  # 50% reduction
+            for k, v in normal_projections.items()
+        }
+        
+        return messages, reduced_projections
+    
     def generate_incoming_projections(
         self, 
-        hours_ahead: int = 2
+        hours_ahead: int = 2,
+        reduction_factor: float = 1.0
     ) -> dict:
         """
         Generate realistic incoming fund projections.
         
         Args:
             hours_ahead: Number of hours to project ahead
+            reduction_factor: Factor to reduce projections (1.0 = normal, 0.5 = 50% reduction)
             
         Returns:
             Dictionary mapping ISO datetime strings to projected amounts
@@ -188,9 +220,9 @@ class ScenarioGenerator:
             hour = projection_time.hour
             
             if 9 <= hour <= 11 or 14 <= hour <= 16:  # Peak hours
-                amount = random.uniform(5000000, 50000000)
+                amount = random.uniform(5000000, 50000000) * reduction_factor
             else:
-                amount = random.uniform(1000000, 10000000)
+                amount = random.uniform(1000000, 10000000) * reduction_factor
             
             projections[projection_time.isoformat()] = amount
         
